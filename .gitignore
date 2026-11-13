@@ -1,0 +1,76 @@
+# ── 依赖 ──
+node_modules
+
+# ── 上游代码的产物：**必须忽略** ──
+# 这两个文件是上游（github.com/zhuweiyou/dsh-providers-hub）代码的拷贝或
+# 打包结果，不是本仓库的代码。上游 README 明确要求「不要转发到 GitHub」，
+# 因此绝不能提交它们 —— 本仓库只通过 package.json 的 git 依赖引用上游。
+#   · upstream-jet-hub.js = 上游 lib/client/jet-hub.js 的原样拷贝
+#   · admin.js            = 含上游客户端代码的 esbuild 产物
+# 两者都由 `npm run build` 从 node_modules 现场生成，无需入库。
+public/admin.js
+public/upstream-jet-hub.js
+
+# ── 运行时状态（切勿入库：含账号索引与凭据）──
+# 默认状态目录在 ~/.codearts2api，但如果有人把 CODEARTS2API_HOME 指到仓库内，
+# 这几条能兜住账号池 / 凭据 / 网关密钥 / 管理密钥。
+/data
+.codearts2api/
+.credentials.yaml
+openai-gateway/
+jet-hub/
+attachments/
+# 管理后台的登录密钥：拿到它就能进后台、导出全部账号、明文取回网关 Key
+admin-key
+admin-key.*.tmp
+
+# DSH 的存储（本程序不读写它，但排除以防误提交）
+.dsh/
+
+# ── 环境与密钥 ──
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ── 日志与调试产物 ──
+*.log
+npm-debug.log*
+*.tmp.mjs
+*.tmp.js
+*.bak
+
+# 上游升级脚本用来取 commit 标题的临时克隆（用完即删，残留也不该入库）
+.upgrade-upstream-tmp/
+
+# ── 编辑器 / 系统 ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ── 构建缓存 ──
+*.tsbuildinfo
+dist/
+build/
+
+# ── 单文件 exe 打包的中间产物 ──
+# packaging/stage/ 是备料目录（源码副本 + 生产依赖 + node.exe），payload.zip 是
+# 压好的载荷，Launcher 的 Go 构建缓存也在下面。这些全部可由
+# `pnpm run build:exe` 重新生成，体积上百 MB，绝不入库。
+packaging/stage/
+packaging/launcher/payload.zip
+packaging/.gopath/
+packaging/.gocache/
+
+# 本机开发用的临时目录（装依赖用的 node/pnpm shim、探针等）
+.build-tools/
+
+# Python 字节码缓存（scripts/make-source-archive.py 生成的）
+__pycache__/
+*.pyc
+
+# ── 源码备份产物 ──
+# 仓库根的加密快照包**要入库**（那是备份本身）；但 dist/ 下的中间副本不入库。
+# （dist/ 已在上面整体忽略，这里不再重复。）
