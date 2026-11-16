@@ -10,7 +10,7 @@
  * 数据全部读本机文件，不向上游发请求（余额除外，有 5 分钟缓存 + 单飞）。
  */
 
-import { readFile, readdir } from "node:fs/promises"
+import { readFile, readdir, rename, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 export const API_PATH = "/admin/dashboard/api"
@@ -412,9 +412,97 @@ export function createDashboard(deps) {
     }
     return { ...doc, today, ranToday: lastDate === today, lagDays }
   }
+
+  // ── 签到日志（本仓库自己的历史档案，2026-11-16 加）────────────────────
+  //
+  // ## 为什么必须自己存
+  //
+  // 上游的 `jet-hub/auto-checkin.json` **只保留「最后一次」** 的
+  // `lastResult` / `lastAt` / `channels` —— 没有历史数组。也就是说，
+  // 「看到自动与手动的签到记录」这件事上游根本没提供数据，光加个按钮只会
+  // 弹出一个永远只有一行的空壳。
+  //
+  // 所以这里做「就地归档」：**每次读签到状态时**，如果发现 `lastAt` 变了
+  // （说明刚跑过一轮），就把这一轮的结果追加进 `jet-hub/checkin-history.json`。
+  // 不依赖上游主动通知，也不用轮询 —— 看板本来就会周期性刷新。
+
+  /** 历史文件（与 auto-checkin.json 同目录，便于一起备份/迁移）。 */
+  const checkinHistoryFile = join(jetHub, "checkin-history.json")
+
+  /** 最多保留的条数：够看几十天，又不会无限长。 */
+  const CHECKIN_HISTORY_LIMIT = 300
+
+  /**
+   * 把「本轮签到结果」并入历史。
+   *
+   * 去重键 = `lastAt`（毫秒时间戳，每轮唯一）。同一轮被反复读到不会重复追加。
+   *
+   * ⚠️ 写盘是**尽力而为**：历史记录属于锦上添花，磁盘满 / 只读目录都只记日志，
+   *    绝不能让看板整体 500。
+   *
+   * @param doc - `auto-checkin.json` 的内容。
+   */
+  async function archiveCheckinRun(doc) {
+    const at = typeof doc?.lastAt === "number" ? doc.lastAt : 0
+    if (at <= 0) return
+    // 没有 lastResult 说明这一轮还没真正跑完（上游可能只在结束时写结果）。
+    const result = typeof doc.lastResult === "string" ? doc.lastResult : ""
+    if (!result) return
+
+    const history = (await readJson(checkinHistoryFile)) || { schema: "codearts2api/checkin-history/v1", entries: [] }
+    const entries = Array.isArray(history.entries) ? history.entries : []
+    if (entries.some((entry) => entry.at === at)) return
+
+    entries.push({
+      at,
+      // 按 UTC+8 记日期，和看板其它时间口径一致。
+      date: utc8Date(new Date(at)),
+      time: new Date(at + 8 * 3600_000).toISOString().slice(11, 19),
+      result,
+      // 触发方式：上游在 `lastSlot` 里记了是哪个时段跑的（`09:00` / `21:00`），
+      // 手动触发不会带这个字段 —— 据此区分「自动 / 手动」。
+      trigger: typeof doc.lastSlot === "string" && doc.lastSlot ? "auto" : "manual",
+      slot: typeof doc.lastSlot === "string" ? doc.lastSlot : "",
+      // 每渠道明细也存一份：日志弹窗里展开就能看「哪个渠道领到了」。
+      channels: Array.isArray(doc.channels)
+        ? doc.channels.map((channel) => ({
+            provider: String(channel?.provider ?? ""),
+            text: String(channel?.text ?? ""),
+          }))
+        : [],
+    })
+
+    // 超限时丢掉最旧的（保留最近的 N 条）。
+    const trimmed = entries.slice(-CHECKIN_HISTORY_LIMIT)
+    try {
+      // 原子写：先写临时文件再 rename，避免「写到一半崩溃」留下半个 JSON，
+      // 那会让下次读到的历史直接坏掉。
+      const temporary = `${checkinHistoryFile}.${process.pid}.tmp`
+      await writeFile(
+        temporary,
+        JSON.stringify({ ...history, schema: "codearts2api/checkin-history/v1", entries: trimmed }, null, 2),
+        "utf8",
+      )
+      await rename(temporary, checkinHistoryFile)
+    } catch (error) {
+      deps.logger?.warn?.(`[dashboard] 签到历史写入失败（不影响看板）：${String(error)}`)
+    }
+  }
+
+  /** 读历史（新的在前）。 */
+  async function checkinHistoryOf() {
+    const doc = await readJson(checkinHistoryFile)
+    const entries = Array.isArray(doc?.entries) ? doc.entries : []
+    return [...entries].reverse()
+  }
   async function snapshot({ fresh = false } = {}) {
     const today = utc8Date()
     const state = (await readJson(join(jetHub, "state.json"))) || {}
+    // 签到状态读一次，供「归档 + 展示」两用（避免读两遍文件）。
+    const checkin = await checkinOf()
+    // 顺便归档：`lastAt` 变了就说明刚跑过一轮（自动或手动都算）。
+    if (checkin) await archiveCheckinRun(checkin)
+    const history = await checkinHistoryOf()
     const accounts = accountsOf(state)
     const providers = [...new Set(accounts.map((a) => a.provider).filter(Boolean))]
     // ⚠️ 解构出的变量不能叫 balances —— 与上面的 balances() 函数同名会在本作用域
@@ -450,7 +538,9 @@ export function createDashboard(deps) {
       //    直接透传会让前端 `c.ranToday === true` 恒为 false，显示「今日签到 未完成」——
       //    2026-11-02 用户实测报「为什么显示今日签到未完成，最近 2026-11-02」。
       //    这里按 UTC+8 日键自己判一次。
-      checkin: await checkinOf(),
+      checkin: checkin,
+      // 签到日志（本仓库自己归档的历史，见 archiveCheckinRun）。
+      checkinHistory: history,
       callers: {
         keys: Array.isArray(callers?.keys) ? callers.keys.length : 0,
         groups: Array.isArray(callers?.groups) ? callers.groups.length : 0,
@@ -529,6 +619,14 @@ export const UI_SRC = String.raw`
   let overlay = null;
   // 上一次成功的快照：再次打开弹窗时先画它（不必等一次网络往返）。
   let lastSnapshot = null;
+
+  /**
+   * 最近一次快照里的签到历史（新的在前）。
+   *
+   * 单独提一份：renderCheckin 只需要条数来显示「签到日志 (N)」，
+   * 走参数传递会把签名改得到处都是；而弹窗要的是完整列表。
+   */
+  let historyEntries = [];
   const openChans = new Set();
   let visible = false;
 
@@ -625,6 +723,14 @@ export const UI_SRC = String.raw`
       ".c2d-pkg{min-width:132px}",
       ".c2d-pkgName{font-size:11px;color:var(--dsw-alias-label-secondary,#5f6672);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:170px}",
       ".c2d-sub2{font-size:11.5px;font-weight:600;margin:10px 0 5px;color:var(--dsw-alias-label-secondary,#5f6672)}",
+      // 签到日志（2026-11-16 加）：按钮行 + 弹窗内的表格细节。
+      ".c2d-checkinLogBar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}",
+      ".c2d-checkinLog .c2d-empty{text-align:left;line-height:1.7}",
+      ".c2d-checkinLogTime{white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-secondary,#5f6672);font-variant-numeric:tabular-nums}",
+      ".c2d-checkinLogResult{line-height:1.6}",
+      ".c2d-checkinLogChannels{margin-top:4px;font-size:11px;line-height:1.7;color:var(--dsw-alias-label-tertiary,#8f959e)}",
+      ".c2d-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:600;white-space:nowrap;background:var(--dsw-alias-bg-layer-3,#f2f3f5);color:var(--dsw-alias-label-secondary,#5f6672)}",
+      ".c2d-badge--ok{background:rgba(0,180,120,.12);color:#0a8f5f}",
       ".c2d-scroll{max-height:212px;overflow:auto}",
       ".c2d-unit{font-size:11px;color:var(--dsw-alias-label-tertiary,#8f959e)}",
       ".c2d-chan{border:1px solid var(--dsw-alias-border-default,#e5e5e5);border-radius:8px;padding:9px 11px;margin:0 0 9px;background:var(--dsw-alias-bg-layer-3,#fff)}",
@@ -1044,7 +1150,24 @@ export const UI_SRC = String.raw`
       return "<tr><td><span class=\"c2d-ch\">" + esc(ch.provider) + "</span></td>" +
         '<td><span class="c2d-dot ' + tone + '"></span>' + esc(t) + "</td></tr>";
     }).join("");
-    return head + '<table class="c2d-tbl" style="margin-top:8px"><thead><tr><th>渠道</th><th>签到状态</th></tr></thead><tbody>' +
+    // 「签到日志」按钮（2026-11-16 用户要求：要能看到自动与手动的签到记录）。
+    //
+    // ⚠️ 按钮放在**本仓库自己的看板**里，而不是上游那个「设置」弹窗里：
+    //    设置弹窗是 public/upstream-jet-hub.js（上游构建产物）渲染的，
+    //    按项目纪律不能手改（改了下次升级就丢），所以挂在看板这里最稳妥。
+    const historyCount = Array.isArray(historyEntries) ? historyEntries.length : 0;
+    const logButton =
+      '<div class="c2d-checkinLogBar">' +
+      '<button type="button" class="c2-btn" id="c2d-checkin-log" ' +
+      'title="查看每一次自动 / 手动签到的结果（本程序自己归档）">' +
+      "签到日志" + (historyCount > 0 ? " (" + String(historyCount) + ")" : "") +
+      "</button>" +
+      (historyCount === 0
+        ? '<span class="c2d-sub2" style="margin-left:8px">还没有记录 —— 跑过一次签到（自动或手动）后这里就会出现。</span>'
+        : "") +
+      "</div>";
+    return head + logButton +
+      '<table class="c2d-tbl" style="margin-top:8px"><thead><tr><th>渠道</th><th>签到状态</th></tr></thead><tbody>' +
       rows + "</tbody></table>";
   }
 
@@ -1076,7 +1199,88 @@ export const UI_SRC = String.raw`
       if (el.open) openChans.add(prov);
       else openChans.delete(prov);
     }, true);
+    // 「签到日志」：每次重新绑定（paint 会重建 body，旧按钮随之消失）。
+    page.addEventListener("click", function (e) {
+      const button = e.target && e.target.closest && e.target.closest("#c2d-checkin-log");
+      if (button) openCheckinLog();
+    });
     return page;
+  }
+
+  /**
+   * 打开「签到日志」弹窗 —— 自动与手动的签到记录。
+   *
+   * ## 数据从哪来
+   *
+   * 上游 auto-checkin.json 只有「最后一次」，没有历史；这里展示的是本仓库
+   * 自己的归档（jet-hub/checkin-history.json，见后端 archiveCheckinRun）。
+   *
+   * 复用外壳的 openModal：焦点管理、Esc 关闭、遮罩点击、焦点归还都已由它处理，
+   * 自己再写一套只会重复这些细节。
+   */
+  function openCheckinLog() {
+    const entries = Array.isArray(historyEntries) ? historyEntries : [];
+    if (!window.__c2Shell?.openModal) {
+      // 外壳不在（理论上不会）时退化成原生 alert，至少让用户看到内容。
+      window.alert(formatCheckinLogText(entries));
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.className = "c2d-checkinLog";
+
+    if (entries.length === 0) {
+      wrap.innerHTML =
+        '<div class="c2d-empty">还没有签到记录。<br />' +
+        "自动签到到点会跑一轮；也可以在「渠道管理」里手动点一次签到。<br />" +
+        "跑过之后这里就会有记录（本程序自己归档，最多保留 300 条）。</div>";
+    } else {
+      const autoCount = entries.filter(function (entry) { return entry.trigger === "auto"; }).length;
+      const manualCount = entries.length - autoCount;
+      const summary =
+        '<div class="c2d-sub2" style="margin-bottom:8px">' +
+        "共 " + String(entries.length) + " 条 · 自动 " + String(autoCount) +
+        " · 手动 " + String(manualCount) + "（新的在前，最多保留 300 条）</div>";
+      const rows = entries.map(function (entry) {
+        const isAuto = entry.trigger === "auto";
+        const badge = isAuto
+          ? '<span class="c2d-badge c2d-badge--ok">自动' + (entry.slot ? " " + esc(entry.slot) : "") + "</span>"
+          : '<span class="c2d-badge">手动</span>';
+        const channels = Array.isArray(entry.channels) ? entry.channels : [];
+        const channelText = channels.length === 0
+          ? ""
+          : '<div class="c2d-checkinLogChannels">' +
+            channels.map(function (channel) {
+              return '<span class="c2d-ch">' + esc(channel.provider) + "</span> " + esc(channel.text);
+            }).join("<br />") +
+            "</div>";
+        return "<tr>" +
+          '<td class="c2d-checkinLogTime">' + esc(entry.date || "") + "<br />" + esc(entry.time || "") + "</td>" +
+          "<td>" + badge + "</td>" +
+          '<td class="c2d-checkinLogResult">' + esc(entry.result || "—") + channelText + "</td>" +
+          "</tr>";
+      }).join("");
+      wrap.innerHTML = summary +
+        '<table class="c2d-tbl"><thead><tr><th style="width:120px">时间</th>' +
+        '<th style="width:90px">方式</th><th>结果</th></tr></thead><tbody>' +
+        rows + "</tbody></table>";
+    }
+
+    window.__c2Shell.openModal({
+      title: "签到日志",
+      subtitle: "自动与手动的签到记录",
+      wide: true,
+      body: wrap,
+    });
+  }
+
+  /** 退化成纯文本（外壳不可用时）。 */
+  function formatCheckinLogText(entries) {
+    if (!entries || entries.length === 0) return "还没有签到记录。";
+    return entries.map(function (entry) {
+      const kind = entry.trigger === "auto" ? "自动" + (entry.slot ? " " + entry.slot : "") : "手动";
+      return (entry.date || "") + " " + (entry.time || "") + " [" + kind + "] " + (entry.result || "");
+    }).join("\n");
   }
 
   function mount(container) {
@@ -1133,6 +1337,8 @@ export const UI_SRC = String.raw`
     const body = overlay && overlay.querySelector("#c2d-body");
     const sub = overlay && overlay.querySelector("#c2d-sub");
     if (!body) return;
+    // 历史随快照一起更新（后端已在 snapshot 里归档并返回）。
+    historyEntries = Array.isArray(d.checkinHistory) ? d.checkinHistory : [];
     body.innerHTML =
       section("网关状态", renderGateway(d)) +
       section("今日用量", renderUsage(d)) +
