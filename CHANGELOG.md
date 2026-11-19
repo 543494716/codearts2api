@@ -7,6 +7,63 @@
 ---
 
 <details open>
+<summary><b>2026-11-19 · 签到汇总提示条加关闭按钮 + 「账号管理」与「可用模型」对调位置</b></summary>
+
+## 需求
+
+1. 截图里那条「一键签到：CodeArts（华为云）+200积分…」的汇总提示条**没有关闭按钮**，点到就一直占着顶部；
+2. 「可用模型」与「账号管理」两块位置对调 —— **账号管理在上、可用模型在下**。
+
+## ① 提示条加关闭按钮（改上游产物）
+
+提示条由 `public/upstream-jet-hub.js` 的 `checkinNotice` 渲染，原本是纯展示：
+
+```js
+checkinNotice ? React.createElement("div", { className: "dim-jh-probeNotice", ... },
+  React.createElement("div", null, checkinNotice.text), ...) : null
+```
+
+改动（经用户确认后直接改上游产物）：
+
+- 外层加 `display: flex`，让「文字占满 + 按钮贴右」；
+- 文字（含 notes 列表）包进 `flex: 1 1 auto; min-width: 0` 的容器，长文案不会把按钮挤走；
+- 新增 `button`（`aria-label="关闭提示"`、`flex: none`），点击调 `setCheckinNotice(null)` ——
+  它是这块提示的**唯一状态源**，置空即不渲染，无需额外状态。
+
+## ② 两块位置对调（改本仓库源码）
+
+**不需要动上游**：「可用模型」这块是本仓库 `src/models-admin.js` 注入的，
+它把 `section.c2x-section` 插到 `main.dim-jh-panel` 的**第一个子节点**，
+所以显示在「XX 账号管理」上方。
+
+改动一行：
+
+```js
+;-main.insertBefore(section, main.firstChild) + // 插最前 → 模型在上
+  main.appendChild(section) // 追加末尾 → 账号在上、模型在下
+```
+
+`main.dim-jh-panel` 里上游渲染的是 `section.dim-jh-accountSection`，
+追加到它后面就自然落到下方。
+
+## 验证
+
+- 上游产物与 `models-admin.js` 均通过 `node --check`；
+- jsdom 实测 DOM 顺序：`[0] section.dim-jh-accountSection` → `[1] section.c2x-section`
+  ⇒ **账号在上、模型在下** ✓；
+- 关闭按钮静态校验 6 项全过（flex 布局 / 文字容器 / 按钮存在 / onClick 调用 /
+  `flex:none` / `×` 符号），且全局只出现 1 次（未误加到别处）；
+- 通过 HTTP 确认服务端供出的 `models-ui.js` 含 `appendChild(section)`、
+  `upstream-jet-hub.js` 含「关闭提示」；
+- `eslint`、`prettier --check` 干净；exe 重新打包成功（构建号 `f724ef39623d`）。
+
+> ⚠️ 上游产物是**本地改动**：下次 `pnpm run build` 会重新从上游拷贝而覆盖掉
+> ①（②在源码里，不受影响）。这一点与项目「不 fork 上游」的纪律有冲突，
+> 是经用户明确同意后按需求做的取舍。
+
+</details>
+
+<details>
 <summary><b>2026-11-16 · 总览看板新增「签到日志」：可查看每次自动 / 手动签到记录</b></summary>
 
 ## 需求

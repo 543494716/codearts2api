@@ -561,7 +561,16 @@ export const UI_SRC = String.raw`
     wrap.innerHTML = html;
     var section = wrap.firstElementChild;
     section.setAttribute("data-c2x-key", key);
-    main.insertBefore(section, main.firstChild);
+    // 位置：**账号管理在上、可用模型在下**（2026-11-19 用户要求调换）。
+    //
+    // 原来是 main.insertBefore(section, main.firstChild) —— 插成第一个子节点，
+    // 于是模型区显示在「XX 账号管理」**上方**。现在改成追加到末尾：
+    // main.dim-jh-panel 里上游渲染的是 section.dim-jh-accountSection
+    // （账号管理 + 账号卡片），追加到它后面就落到下方。
+    //
+    // ⚠️ 必须用 appendChild 而不是 insertBefore(…, null)：两者等价，但后者
+    //    容易被误读成「插在最前」，写 appendChild 意图更明确。
+    main.appendChild(section);
   }
 
   function ensureData(providerId) {
